@@ -44,7 +44,7 @@ const startThreshold = 50 * 1024 * 1024; //50MB
 /**- **警告**: 免费worker设置64KB时传输相同流量cpu开销最低。*/
 const maxChunkLen = 64 * 1024;        // 64KB
 /** 进入缓冲模式时的缓冲区发送的触发时间。*/
-const flushTime = 10;                 // 10ms
+const flushTime = 20;                 // 20ms
 // ---------------------------------------------------------------------------------
 /** SS AEAD加密时每批并发处理的payload分片数量，length加密开销低，会随payload一起提交。*/
 const ssAeadEncryptCount = 4;
@@ -574,7 +574,7 @@ const parseProtocolChunk = (chunk, socks5State) => {
                     if (!matchAuth) return result.handshake = httpRes407, result;
                 }
                 let lastColon = -1;
-                for (let i = secondSpace - 3; i >= 8; i--) {
+                for (let i = secondSpace - 4; i >= 8; i--) {
                     if (chunk[i] === 58) {
                         lastColon = i;
                         break;
@@ -700,47 +700,6 @@ const dohDnsHandler = async (payload) => {
     packet[0] = (udpSize >> 8) & 0xff, packet[1] = udpSize & 0xff;
     packet.set(new Uint8Array(dnsQueryResult), 2);
     return packet;
-};
-const createDnsWriter = (state, writable, close, closeAfterResponse) => {
-    let pending = emptyU8, closed = false;
-    const sendDnsResponse = async (dnsPack) => {
-        if (state.ssOutbound) {
-            if (state.ssResponseSalt) {
-                writable.send(state.ssResponseSalt);
-                state.ssResponseSalt = null;
-            }
-            const encryptedDns = await ssAeadEncryptChunks(state.ssOutbound, dnsPack);
-            if (encryptedDns.byteLength) writable.send(encryptedDns);
-        } else {
-            writable.send(dnsPack);
-        }
-    };
-    return async (chunk) => {
-        if (closed || !chunk?.byteLength) return;
-        chunk = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-        let buf = chunk;
-        if (pending.byteLength) {
-            buf = new Uint8Array(pending.byteLength + chunk.byteLength);
-            buf.set(pending);
-            buf.set(chunk, pending.byteLength);
-            pending = emptyU8;
-        }
-        let offset = 0;
-        while (buf.byteLength - offset >= 2) {
-            const dnsLen = (buf[offset] << 8) | buf[offset + 1];
-            const end = offset + 2 + dnsLen;
-            if (buf.byteLength < end) break;
-            const dnsPack = await dohDnsHandler(buf.subarray(offset, end));
-            if (dnsPack?.byteLength) await sendDnsResponse(dnsPack);
-            offset = end;
-            if (closeAfterResponse) {
-                closed = true;
-                close();
-                return;
-            }
-        }
-        if (offset < buf.byteLength) pending = buf.slice(offset);
-    };
 };
 const addrTypeIs = (hostname) => {
     const char0 = hostname.charCodeAt(0);
@@ -902,9 +861,9 @@ const chunkIdxLookup = new Uint8Array([
 ]);
 const lowerBounds = new Uint16Array([1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 12288, 20480, 28672]);
 const manualPipe = async (readable, writable, close) => {
-    const safeBufferSize = bufferSize - maxChunkLen, fastFlushOffset = Math.max(bufferSize / flushTime * 2, maxChunkLen * 2);
+    const safeBufferSize = bufferSize - maxChunkLen, fastFlushOffset = bufferSize / flushTime * 2;
     let buffer = new ArrayBuffer(bufferSize), spareBuffer = new ArrayBuffer(maxChunkLen), bufferView = new Uint8Array(buffer);
-    let offset = 0, totalBytes = 0, time = 1, timerId = null, resume = null, isReading = false, needsFlush = false, protectFlush = false;
+    let offset = 0, totalBytes = 0, time = 2, timerId = null, resume = null, isReading = false, needsFlush = false, protectFlush = false;
     let globalCount = new Uint32Array(14), globalBytes = new Uint32Array(14);
     let statCount = 0, totalCount = 0, totalGlobalBytes = 0, isClose = false, fastFlush = true;
     const flushBuffer = () => {
@@ -949,7 +908,7 @@ const manualPipe = async (readable, writable, close) => {
                 flushBuffer();
             } else {
                 if (fastFlush) {
-                    time = 1;
+                    time = 2;
                 } else {
                     const idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
                     globalCount[idx]++, globalBytes[idx] += chunkLen, statCount++, totalCount++, totalGlobalBytes += chunkLen;
@@ -964,7 +923,7 @@ const manualPipe = async (readable, writable, close) => {
                         score > maxScore && (maxScore = score, maxIdx = i);
                     }
                     if (chunkLen < lowerBounds[maxIdx]) {
-                        totalBytes = 0, time = 1;
+                        totalBytes = 0, time = 2;
                     } else if ((totalBytes += chunkLen) > startThreshold) {
                         time = flushTime;
                     }
@@ -975,95 +934,7 @@ const manualPipe = async (readable, writable, close) => {
         }
     } catch {close?.(), isClose = true} finally {isReading = false, flushBuffer()}
 };
-const createBufferedTcpWriter = (tcpWriter, close) => {
-    let writeQueue = [], spareQueue = [], coalesceBuffer = null, drainActive = false, closed = false;
-    const closeWriter = () => {
-        if (closed) return;
-        closed = true, writeQueue.length = 0, spareQueue.length = 0, close?.();
-    };
-    const drainQueue = async () => {
-        if (closed) return;
-        drainActive = true;
-        try {
-            while (writeQueue.length && !closed) {
-                const queue = writeQueue;
-                writeQueue = spareQueue;
-                spareQueue = queue;
-                let index = 0, queueLength = queue.length;
-                while (index < queueLength && !closed) {
-                    const chunk = queue[index];
-                    let mergedLength = chunk.byteLength, mergeEnd = index + 1;
-                    if (mergedLength < maxChunkLen) {
-                        while (mergeEnd < queueLength) {
-                            const nextLength = mergedLength + queue[mergeEnd].byteLength;
-                            if (nextLength > maxChunkLen) break;
-                            mergedLength = nextLength, mergeEnd++;
-                        }
-                    }
-                    if (mergeEnd === index + 1) {
-                        queue[index++] = undefined;
-                        await tcpWriter.write(chunk);
-                    } else {
-                        const buffer = coalesceBuffer ||= new Uint8Array(maxChunkLen);
-                        buffer.set(chunk);
-                        queue[index++] = undefined;
-                        for (let offset = chunk.byteLength; index < mergeEnd;) {
-                            const nextChunk = queue[index];
-                            queue[index++] = undefined;
-                            buffer.set(nextChunk, offset), offset += nextChunk.byteLength;
-                        }
-                        await tcpWriter.write(buffer.subarray(0, mergedLength));
-                    }
-                }
-                queue.length = 0;
-            }
-        } catch {closeWriter()} finally {
-            drainActive = false;
-            if (writeQueue.length && !closed) {
-                drainActive = true;
-                queueMicrotask(drainQueue);
-            }
-        }
-    };
-    return chunk => {
-        if (closed) return false;
-        const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-        if (!data.byteLength) return true;
-        writeQueue.push(data);
-        if (!drainActive) {
-            drainActive = true;
-            queueMicrotask(drainQueue);
-        }
-        return true;
-    };
-};
-const createAsyncMicrotaskQueue = (consume, close) => {
-    let queue = [], spareQueue = [], drainActive = false, closed = false;
-    const drainQueue = async () => {
-        if (closed) return;
-        drainActive = true;
-        try {
-            while (queue.length && !closed) {
-                const currentQueue = queue;
-                queue = spareQueue, spareQueue = currentQueue;
-                for (let i = 0, len = currentQueue.length; i < len && !closed; i++) {
-                    const chunk = currentQueue[i];
-                    currentQueue[i] = undefined;
-                    const res = consume(chunk);
-                    if (res?.then) await res;
-                }
-                currentQueue.length = 0;
-            }
-        } catch {closed = true, close?.()} finally {drainActive = false}
-    };
-    return chunk => {
-        if (!closed) {
-            queue.push(chunk);
-            if (!drainActive) drainActive = true, queueMicrotask(drainQueue);
-        }
-    };
-};
-const handleSession = async (chunk, state, request, writable, close, isEarlyData = false) => {
+const handleSession = async (chunk, state, request, writable, close) => {
     const allowNeedMore = state.allowNeedMore === true;
     if (allowNeedMore) state.needMore = false;
     let parsedRequest, payload, isSs = false;
@@ -1106,39 +977,52 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         payload = chunk.subarray(parsedRequest.dataOffset);
     }
     if (parsedRequest.isDns) {
-        const dnsWriter = createDnsWriter(state, writable, close, !(isEarlyData && payload.byteLength));
-        state.tcpWriter = (isSs || state.ssOutbound) ? async (c) => {
-            await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), dnsWriter);
-        } : dnsWriter;
-        return await dnsWriter(payload);
+        const dnsPack = await dohDnsHandler(payload);
+        if (dnsPack?.byteLength) {
+            if (isSs || state.ssOutbound) {
+                if (state.ssResponseSalt) {
+                    writable.send(state.ssResponseSalt);
+                    state.ssResponseSalt = null;
+                }
+                const encryptedDns = await ssAeadEncryptChunks(state.ssOutbound, dnsPack);
+                if (encryptedDns.byteLength) writable.send(encryptedDns);
+            } else {
+                writable.send(dnsPack);
+            }
+        }
+        return close();
     } else {
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
         if (!state.tcpSocket) return close();
         const tcpWriter = state.tcpSocket.writable.getWriter();
-        const bufferedTcpWriter = createBufferedTcpWriter(tcpWriter, close);
-        if (payload.byteLength) tcpWriter.write(payload);
+        if (payload.byteLength) await tcpWriter.write(payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
                 await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
-                    if (plain.byteLength) bufferedTcpWriter(plain);
+                    if (plain.byteLength) await tcpWriter.write(plain);
                 });
             };
             state.ssResponseSalt?.length && writable.send(state.ssResponseSalt);
             state.ssResponseSalt = null;
             (async () => {
-                const ssSendQueue = createAsyncMicrotaskQueue(async (chunk) => {
-                    const encrypted = await ssAeadEncryptChunks(state.ssOutbound, chunk);
-                    encrypted.byteLength && writable.send(encrypted);
-                }, close);
-                state.tcpSocket.extra?.length && ssSendQueue(state.tcpSocket.extra);
-                await manualPipe(state.tcpSocket.readable, {
-                    send: (chunk) => {
-                        chunk?.byteLength && ssSendQueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
-                    }
-                }, close);
-            })().catch(close);
+                let flushPromise = Promise.resolve();
+                state.tcpSocket.extra?.length && (flushPromise = flushPromise.then(async () => {
+                    const encryptedExtra = await ssAeadEncryptChunks(state.ssOutbound, state.tcpSocket.extra);
+                    encryptedExtra.byteLength && writable.send(encryptedExtra);
+                }));
+                try {
+                    await manualPipe(state.tcpSocket.readable, {
+                        send: (chunk) => {
+                            flushPromise = flushPromise.then(async () => {
+                                const encrypted = await ssAeadEncryptChunks(state.ssOutbound, chunk);
+                                encrypted.byteLength && writable.send(encrypted);
+                            });
+                        }
+                    }, close);
+                } finally {await flushPromise}
+            })();
         } else {
-            state.tcpWriter = bufferedTcpWriter;
+            state.tcpWriter = (c) => tcpWriter.write(c);
             if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
             manualPipe(state.tcpSocket.readable, writable, close);
         }
@@ -1149,15 +1033,14 @@ const handleWebSocketConn = async (webSocket, request) => {
     // @ts-ignore
     const earlyData = protocolHeader ? Uint8Array.fromBase64(protocolHeader, {alphabet: 'base64url'}) : null;
     const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null};
-    let processingQueue = null;
     const close = () => {webSocket.close()};
-    const process = (chunk) => {
+    let processingChain = Promise.resolve();
+    const process = async (chunk) => {
         if (state.tcpWriter) return state.tcpWriter(chunk);
-        return handleSession(earlyData ? chunk : new Uint8Array(chunk), state, request, webSocket, close, earlyData !== null);
+        await handleSession(earlyData ? chunk : new Uint8Array(chunk), state, request, webSocket, close);
     };
-    processingQueue = createAsyncMicrotaskQueue(process, close);
-    if (earlyData) processingQueue(earlyData);
-    webSocket.addEventListener("message", event => (state.tcpWriter || processingQueue)(event.data));
+    if (earlyData) processingChain = processingChain.then(() => process(earlyData).catch(close));
+    webSocket.addEventListener("message", event => {processingChain = processingChain.then(() => process(event.data).catch(close))});
     webSocket.addEventListener("error", close);
 };
 const grpcHeaders = {'Content-Type': 'application/grpc', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
